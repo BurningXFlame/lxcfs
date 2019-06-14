@@ -38,6 +38,7 @@
 
 #include "bindings.h"
 #include "config.h" // for VERSION
+#include "sb.h"
 
 /* Define pivot_root() if missing from the C library */
 #ifndef HAVE_PIVOT_ROOT
@@ -3680,6 +3681,35 @@ int max_cpu_count(const char *cg)
 }
 
 /*
+ * Return the exact number of visible CPUs based on CPU quotas.
+ * If there is no quota set, zero is returned.
+ */
+static double exact_cpu_count(const char *cg)
+{
+	double rv;
+	int nprocs;
+	int64_t cfs_quota, cfs_period;
+
+	if (!read_cpu_cfs_param(cg, "quota", &cfs_quota))
+		return 0;
+
+	if (!read_cpu_cfs_param(cg, "period", &cfs_period))
+		return 0;
+
+	if (cfs_quota <= 0 || cfs_period <= 0)
+		return 0;
+
+	rv = (double)cfs_quota / (double)cfs_period;
+
+	nprocs = get_nprocs();
+
+	if (rv > nprocs)
+		rv = nprocs;
+
+	return rv;
+}
+
+/*
  * Determine whether CPU views should be used or not.
  */
 bool use_cpuview(const char *cg)
@@ -4025,7 +4055,7 @@ static int read_cpuacct_usage_all(char *cg, char *cpuset, struct cpuacct_usage *
 {
 	int cpucount = get_nprocs_conf();
 	struct cpuacct_usage *cpu_usage;
-	int rv = 0, i, j, ret, read_pos = 0, read_cnt;
+	int rv = 0, i, j, ret;
 	int cg_cpu;
 	uint64_t cg_user, cg_system;
 	int64_t ticks_per_sec;
@@ -4034,7 +4064,7 @@ static int read_cpuacct_usage_all(char *cg, char *cpuset, struct cpuacct_usage *
 	ticks_per_sec = sysconf(_SC_CLK_TCK);
 
 	if (ticks_per_sec < 0 && errno == EINVAL) {
-		lxcfs_debug(
+		lxcfs_v(
 			"%s\n",
 			"read_cpuacct_usage_all failed to determine number of clock ticks "
 			"in a second");
@@ -4045,11 +4075,49 @@ static int read_cpuacct_usage_all(char *cg, char *cpuset, struct cpuacct_usage *
 	if (!cpu_usage)
 		return -ENOMEM;
 
+	memset(cpu_usage, 0, sizeof(struct cpuacct_usage) * cpucount);
 	if (!cgfs_get_value("cpuacct", cg, "cpuacct.usage_all", &usage_str)) {
-		rv = -1;
-		goto err;
+		lxcfs_v("failed to read cpuacct.usage_all%s\n", "");
+
+		// read cpuacct.usage_percpu instead
+		lxcfs_v("reading cpuacct.usage_percpu instead%s\n", "");
+		if (!cgfs_get_value("cpuacct", cg, "cpuacct.usage_percpu", &usage_str)) {
+			rv = -1;
+			goto err;
+		}
+
+		// convert cpuacct.usage_percpu into cpuacct.usage_all
+		lxcfs_v("converting cpuacct.usage_percpu into cpuacct.usage_all%s\n", "");
+		stringbuilder *sb = sb_create();
+		if (NULL == sb) {
+			rv = -1;
+			goto err;
+		}
+		if (SB_FAILURE == sb_append(sb, "cpu user system\n")) {
+			sb_free(sb);
+			rv = -1;
+			goto err;
+		}
+		int i = 0, read_pos = 0, read_cnt=0;
+		while (sscanf(usage_str + read_pos, "%lu %n", &cg_user, &read_cnt) > 0) {
+			lxcfs_debug("i: %d, cg_user: %lu, read_pos: %d, read_cnt: %d\n", i, cg_user, read_pos, read_cnt);
+			if (SB_FAILURE == sb_appendf(sb, "%d %lu %lu\n", i, cg_user, 0)) {
+				sb_free(sb);
+				rv = -1;
+				goto err;
+			}
+			i++;
+			read_pos += read_cnt;
+		}
+
+		free(usage_str);
+		usage_str = sb_concat(sb);
+		sb_free(sb);
+
+		lxcfs_debug("usage_str: %s\n", usage_str);
 	}
 
+	int read_pos = 0, read_cnt=0;
 	if (sscanf(usage_str, "cpu user system\n%n", &read_cnt) != 0) {
 		lxcfs_error("read_cpuacct_usage_all reading first line from "
 				"%s/cpuacct.usage_all failed.\n", cg);
@@ -4563,13 +4631,13 @@ static int cpuview_proc_stat(const char *cg, const char *cpuset, struct cpuacct_
 		threshold = total_sum / cpu_cnt * max_cpus;
 
 		for (curcpu = 0, i = -1; curcpu < nprocs; curcpu++) {
-			if (i == max_cpus)
-				break;
-
 			if (!stat_node->usage[curcpu].online)
 				continue;
 
 			i++;
+
+			if (i == max_cpus)
+				break;
 
 			if (diff[curcpu].user + diff[curcpu].system >= threshold)
 				continue;
@@ -4597,14 +4665,19 @@ static int cpuview_proc_stat(const char *cg, const char *cpuset, struct cpuacct_
 		if (system_surplus > 0)
 			lxcfs_debug("leftover system: %lu for %s\n", system_surplus, cg);
 
+		unsigned long diff_user = 0;
+		unsigned long diff_system = 0;
+		unsigned long diff_idle = 0;
+		unsigned long max_diff_idle = 0;
+		unsigned long max_diff_idle_index = 0;
 		for (curcpu = 0, i = -1; curcpu < nprocs; curcpu++) {
-			if (i == max_cpus)
-				break;
-
 			if (!stat_node->usage[curcpu].online)
 				continue;
 
 			i++;
+
+			if (i == max_cpus)
+				break;
 
 			stat_node->view[curcpu].user += diff[curcpu].user;
 			stat_node->view[curcpu].system += diff[curcpu].system;
@@ -4613,8 +4686,34 @@ static int cpuview_proc_stat(const char *cg, const char *cpuset, struct cpuacct_
 			user_sum += stat_node->view[curcpu].user;
 			system_sum += stat_node->view[curcpu].system;
 			idle_sum += stat_node->view[curcpu].idle;
-		}
 
+			diff_user += diff[curcpu].user;
+			diff_system += diff[curcpu].system;
+			diff_idle += diff[curcpu].idle;
+			if (diff[curcpu].idle > max_diff_idle) {
+				max_diff_idle = diff[curcpu].idle;
+				max_diff_idle_index = curcpu;
+			}
+
+			lxcfs_v("curcpu: %d, diff_user: %lu, diff_system: %lu, diff_idle: %lu\n", curcpu, diff[curcpu].user, diff[curcpu].system, diff[curcpu].idle);
+		}
+		lxcfs_v("total. diff_user: %lu, diff_system: %lu, diff_idle: %lu\n", diff_user, diff_system, diff_idle);
+
+		// revise cpu usage view to support partial cpu case
+		double exact_cpus = exact_cpu_count(cg);
+		if (exact_cpus < (double)max_cpus){
+			lxcfs_v("revising cpu usage view to match the exact cpu count [%f]\n", exact_cpus);
+			unsigned long delta = (unsigned long)((double)(diff_user + diff_system + diff_idle) * (1 - exact_cpus / (double)max_cpus));
+			lxcfs_v("delta: %lu\n", delta);
+			lxcfs_v("idle_sum before: %lu\n", idle_sum);
+			idle_sum = idle_sum > delta ? idle_sum - delta : 0;
+			lxcfs_v("idle_sum after: %lu\n", idle_sum);
+			
+			curcpu = max_diff_idle_index;
+			lxcfs_v("curcpu: %d, idle before: %lu\n", curcpu, stat_node->view[curcpu].idle);
+			stat_node->view[curcpu].idle = stat_node->view[curcpu].idle > delta ? stat_node->view[curcpu].idle - delta : 0;
+			lxcfs_v("curcpu: %d, idle after: %lu\n", curcpu, stat_node->view[curcpu].idle);
+		}
 	} else {
 		for (curcpu = 0; curcpu < nprocs; curcpu++) {
 			if (!stat_node->usage[curcpu].online)
@@ -4636,12 +4735,12 @@ static int cpuview_proc_stat(const char *cg, const char *cpuset, struct cpuacct_
 			user_sum,
 			system_sum,
 			idle_sum);
+	lxcfs_v("cpu-all: %s\n", buf);
 
 	if (l < 0) {
 		perror("Error writing to cache");
 		rv = 0;
 		goto err;
-
 	}
 	if (l >= buf_size) {
 		lxcfs_error("%s\n", "Internal error: truncated write to cache.");
@@ -4668,6 +4767,7 @@ static int cpuview_proc_stat(const char *cg, const char *cpuset, struct cpuacct_
 				stat_node->view[curcpu].user,
 				stat_node->view[curcpu].system,
 				stat_node->view[curcpu].idle);
+		lxcfs_v("cpu: %s\n", buf);
 
 		if (l < 0) {
 			perror("Error writing to cache");
@@ -4770,9 +4870,11 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	}
 
 	pid_t initpid = lookup_initpid_in_store(fc->pid);
+	lxcfs_v("initpid: %d\n", initpid);
 	if (initpid <= 0)
 		initpid = fc->pid;
 	cg = get_pid_cgroup(initpid, "cpuset");
+	lxcfs_v("cg: %s\n", cg);
 	if (!cg)
 		return read_file("/proc/stat", buf, size, d);
 	prune_init_slice(cg);
@@ -4787,7 +4889,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	 * CPU usage. If not, values from the host's /proc/stat are used.
 	 */
 	if (read_cpuacct_usage_all(cg, cpuset, &cg_cpu_usage, &cg_cpu_usage_size) != 0) {
-		lxcfs_debug("%s\n", "proc_stat_read failed to read from cpuacct, "
+		lxcfs_v("%s\n", "proc_stat_read failed to read from cpuacct, "
 				"falling back to the host's /proc/stat");
 	}
 
