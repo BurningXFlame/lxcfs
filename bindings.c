@@ -17,6 +17,7 @@
 #include <libgen.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -38,7 +39,6 @@
 
 #include "bindings.h"
 #include "config.h" // for VERSION
-#include "sb.h"
 
 /* Define pivot_root() if missing from the C library */
 #ifndef HAVE_PIVOT_ROOT
@@ -1437,19 +1437,22 @@ again:
 	return 0;
 }
 
-
 /*
- * append pid to *src.
- * src: a pointer to a char* in which ot append the pid.
+ * append the given formatted string to *src.
+ * src: a pointer to a char* in which to append the formatted string.
  * sz: the number of characters printed so far, minus trailing \0.
  * asz: the allocated size so far
- * pid: the pid to append
+ * format: string format. See printf for details.
+ * ...: varargs. See printf for details.
  */
-static void must_strcat_pid(char **src, size_t *sz, size_t *asz, pid_t pid)
+static void must_strcat(char **src, size_t *sz, size_t *asz, const char *format, ...)
 {
-	char tmp[30];
+	char tmp[BUF_RESERVE_SIZE];
+	va_list		args;
 
-	int tmplen = sprintf(tmp, "%d\n", (int)pid);
+	va_start (args, format);
+	int tmplen = vsnprintf(tmp, BUF_RESERVE_SIZE, format, args);
+	va_end(args);
 
 	if (!*src || tmplen + *sz + 1 >= *asz) {
 		char *tmp;
@@ -1461,6 +1464,18 @@ static void must_strcat_pid(char **src, size_t *sz, size_t *asz, pid_t pid)
 	}
 	memcpy((*src) +*sz , tmp, tmplen+1); /* include the \0 */
 	*sz += tmplen;
+}
+
+/*
+ * append pid to *src.
+ * src: a pointer to a char* in which ot append the pid.
+ * sz: the number of characters printed so far, minus trailing \0.
+ * asz: the allocated size so far
+ * pid: the pid to append
+ */
+static void must_strcat_pid(char **src, size_t *sz, size_t *asz, pid_t pid)
+{
+	must_strcat(src, sz, asz, "%d\n", (int)pid);
 }
 
 /*
@@ -4077,44 +4092,34 @@ static int read_cpuacct_usage_all(char *cg, char *cpuset, struct cpuacct_usage *
 
 	memset(cpu_usage, 0, sizeof(struct cpuacct_usage) * cpucount);
 	if (!cgfs_get_value("cpuacct", cg, "cpuacct.usage_all", &usage_str)) {
-		lxcfs_v("failed to read cpuacct.usage_all%s\n", "");
-
 		// read cpuacct.usage_percpu instead
-		lxcfs_v("reading cpuacct.usage_percpu instead%s\n", "");
+		lxcfs_v("failed to read cpuacct.usage_all. reading cpuacct.usage_percpu instead\n%s", "");
 		if (!cgfs_get_value("cpuacct", cg, "cpuacct.usage_percpu", &usage_str)) {
 			rv = -1;
 			goto err;
 		}
+		lxcfs_v("usage_str: %s\n", usage_str);
 
 		// convert cpuacct.usage_percpu into cpuacct.usage_all
-		lxcfs_v("converting cpuacct.usage_percpu into cpuacct.usage_all%s\n", "");
-		stringbuilder *sb = sb_create();
-		if (NULL == sb) {
-			rv = -1;
-			goto err;
-		}
-		if (SB_FAILURE == sb_append(sb, "cpu user system\n")) {
-			sb_free(sb);
-			rv = -1;
-			goto err;
-		}
+		lxcfs_v("converting cpuacct.usage_percpu into cpuacct.usage_all\n%s", "");
+		
+		char *data = NULL;
+		size_t sz = 0, asz = 0;
+
+		must_strcat(&data, &sz, &asz, "cpu user system\n");
+
 		int i = 0, read_pos = 0, read_cnt=0;
 		while (sscanf(usage_str + read_pos, "%lu %n", &cg_user, &read_cnt) > 0) {
 			lxcfs_debug("i: %d, cg_user: %lu, read_pos: %d, read_cnt: %d\n", i, cg_user, read_pos, read_cnt);
-			if (SB_FAILURE == sb_appendf(sb, "%d %lu %lu\n", i, cg_user, 0)) {
-				sb_free(sb);
-				rv = -1;
-				goto err;
-			}
+			must_strcat(&data, &sz, &asz, "%d %lu 0\n", i, cg_user);
 			i++;
 			read_pos += read_cnt;
 		}
 
 		free(usage_str);
-		usage_str = sb_concat(sb);
-		sb_free(sb);
+		usage_str = data;
 
-		lxcfs_debug("usage_str: %s\n", usage_str);
+		lxcfs_v("usage_str: %s\n", usage_str);
 	}
 
 	int read_pos = 0, read_cnt=0;
